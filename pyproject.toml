@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "lscodec-inference"
+version = "0.1.0"
+description = "Inference-only fixed/sliding-window runtime for released LSCodec weights"
+readme = "README.md"
+license = {file = "LICENSE"}
+requires-python = ">=3.10"
+dependencies = [
+    "huggingface-hub>=0.23,<2",
+    "numpy>=1.23,<2",
+    "resampy>=0.4,<1",
+    "soundfile>=0.10,<1",
+    "torch>=2.4,<3",
+]
+
+[project.scripts]
+lscodec-stream = "lscodec_inference.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

@@ -1,0 +1,20 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+dist/
+build/
+
+# Weights are hosted separately on Hugging Face. Never commit them here.
+*.pt
+*.ptl
+*.ts
+*.pkl
+*.ckpt
+*.safetensors
+*.npy
+
+# Generated media.
+*.wav
+*.flac
