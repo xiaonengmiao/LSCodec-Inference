@@ -15,6 +15,7 @@ def test_public_tree_has_no_model_or_training_checkpoints():
         ".ckpt",
         ".safetensors",
         ".npy",
+        ".onnx",
     }
     leaked = [
         path.relative_to(ROOT)

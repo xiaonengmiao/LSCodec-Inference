@@ -6,7 +6,7 @@ import argparse
 import logging
 from typing import Optional
 
-from .model import DEFAULT_MODEL_ID, LSCodecStreaming
+from .model import BACKENDS, DEFAULT_MODEL_ID, LSCodecStreaming
 from .streaming import StreamingConfig
 
 
@@ -39,6 +39,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--device", default="auto", help="auto, cpu, cuda, or cuda:N"
     )
+    parser.add_argument(
+        "--backend",
+        choices=BACKENDS,
+        default="auto",
+        help=(
+            "inference artifacts: torchscript, onnx (ONNX Runtime), or the "
+            "legacy CPU-only lite set; auto prefers torchscript"
+        ),
+    )
+    parser.add_argument(
+        "--threads",
+        type=int,
+        help="ONNX Runtime intra-op threads (default: min(16, CPU count))",
+    )
     parser.add_argument("--revision", help="Hugging Face revision")
     parser.add_argument("--cache-dir")
     parser.add_argument("--local-files-only", action="store_true")
@@ -68,7 +82,9 @@ def main(argv: Optional[list[str]] = None) -> int:
         arrival_ms=args.arrival_ms,
         prompt_anchor_ms=args.prompt_anchor_ms,
     )
-    logging.info("Loading %s on %s", args.model, args.device)
+    logging.info(
+        "Loading %s (%s backend) on %s", args.model, args.backend, args.device
+    )
     codec = LSCodecStreaming.from_pretrained(
         args.model,
         wavlm_path=args.wavlm,
@@ -76,6 +92,8 @@ def main(argv: Optional[list[str]] = None) -> int:
         cache_dir=args.cache_dir,
         revision=args.revision,
         local_files_only=args.local_files_only,
+        backend=args.backend,
+        onnx_threads=args.threads,
     )
     codec.reconstruct_file(
         args.input,

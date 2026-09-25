@@ -1,6 +1,7 @@
 """Public, inference-only LSCodec streaming runtime."""
 
-from .model import DEFAULT_MODEL_ID, LSCodecStreaming
+from .model import BACKENDS, DEFAULT_MODEL_ID, LSCodecStreaming
+from .onnx_backend import OnnxModule
 from .streaming import (
     FixedWindowEncoder,
     SlidingWindowVocoder,
@@ -9,9 +10,11 @@ from .streaming import (
 )
 
 __all__ = [
+    "BACKENDS",
     "DEFAULT_MODEL_ID",
     "FixedWindowEncoder",
     "LSCodecStreaming",
+    "OnnxModule",
     "SlidingWindowVocoder",
     "StreamingConfig",
     "StreamingSession",

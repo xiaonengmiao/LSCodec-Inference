@@ -15,6 +15,7 @@ FORBIDDEN_SUFFIXES = {
     ".ckpt",
     ".safetensors",
     ".npy",
+    ".onnx",
 }
 FORBIDDEN_DIRECTORIES = {
     "conf",

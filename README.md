@@ -18,9 +18,11 @@ The runtime downloads `codebook.npy` plus the preferred CUDA/CPU TorchScript set
 - `torchscript/lscodec_prompt.ts`;
 - `torchscript/lscodec_vocoder.ts`.
 
-For compatibility it can fall back to the older CPU/mobile pair under `ptl/`.
-All of these are inference-only exports; the larger research repository and its
-Python model architecture are not needed.
+An equivalent ONNX set (`onnx/lscodec_encoder.onnx`, `onnx/lscodec_prompt.onnx`,
+`onnx/lscodec_vocoder.onnx`) runs the same streaming protocol on ONNX Runtime;
+see [ONNX backend](#onnx-backend). For compatibility it can also fall back to
+the older CPU/mobile pair under `ptl/`. All of these are inference-only exports;
+the larger research repository and its Python model architecture are not needed.
 
 ## What “streaming” means
 
@@ -47,6 +49,8 @@ CUDA environment first, then install this project:
 git clone https://github.com/xiaonengmiao/LSCodec-Inference.git
 cd LSCodec-Inference
 python -m pip install -e .
+# Optional ONNX Runtime backend: CPU, or CUDA via onnxruntime-gpu
+python -m pip install -e ".[onnx]"      # or: -e ".[onnx-gpu]"
 ```
 
 The vocoder uses WavLM-Large layer 6 for the speaker prompt. Download the
@@ -86,10 +90,11 @@ lscodec-stream input.wav reconstructed.wav \
   --wavlm /path/to/WavLM-Large.pt
 ```
 
-The local model directory must contain `codebook.npy` and either all three
-files under `torchscript/` (recommended, CPU and CUDA) or both files under
-`ptl/` (legacy CPU/mobile fallback). The raw `.pt` files and YAML
-training/research configs are not required.
+The local model directory must contain `codebook.npy` and one complete artifact
+set: all three files under `torchscript/` (recommended, CPU and CUDA), all three
+under `onnx/` (ONNX Runtime), or both files under `ptl/` (legacy CPU/mobile
+fallback). `--backend auto` prefers TorchScript, then ONNX, then Lite. The raw
+`.pt` files and YAML training/research configs are not required.
 
 Window controls mirror the private reference script:
 
@@ -148,6 +153,49 @@ output_24khz = codec.reconstruct(
 Each live session is single-utterance and single-use. Create a new session for
 the next utterance.
 
+## ONNX backend
+
+The `onnx/` graphs are the same three interfaces as `torchscript/`, with dynamic
+time axes:
+
+| File | Inputs | Output |
+| --- | --- | --- |
+| `onnx/lscodec_encoder.onnx` | `waveform` `(1, 1, samples)` at 16 kHz | `indices` `(tokens, groups)` int64 |
+| `onnx/lscodec_prompt.onnx` | `prompt_features` `(1, frames, 1024)` WavLM layer 6 | `prompt_cache` |
+| `onnx/lscodec_vocoder.onnx` | `vq` `(1, vectors, 64)` at 50 Hz, `prompt_cache` | `waveform` `(1, 1, samples)` at 24 kHz |
+
+Select it with `--backend onnx` or `backend="onnx"`:
+
+```bash
+lscodec-stream input.wav reconstructed.wav --backend onnx
+```
+
+```python
+codec = LSCodecStreaming.from_pretrained(
+    "Icerm/lscodec_25hz_v3",
+    wavlm_path="/absolute/path/to/WavLM-Large.pt",
+    backend="onnx",
+)
+```
+
+Only the ONNX files are downloaded for `backend="onnx"`. The streaming protocol
+is unchanged: the same fixed-window encoder, sliding-window vocoder, crossfade,
+and 320 ms prompt-normalization anchor. The anchor is not baked into a graph;
+the runtime appends it to every encoder window, exactly as for TorchScript.
+The speaker prompt still uses the PyTorch WavLM-Large model, once per session.
+
+On CPU, ONNX Runtime uses `min(16, CPU count)` intra-op threads by default.
+Its own default, one thread per physical core, is slower on large multi-socket
+servers. Override with `--threads N` or `onnx_threads=N`. On CUDA, install
+`onnxruntime-gpu`; `device="auto"` then runs the graphs with the CUDA execution
+provider.
+
+The ONNX and TorchScript backends share token schedules and output lengths.
+About 0.3% of transferred tokens can differ, because the nearest-codeword
+search breaks near-ties differently under each runtime's float arithmetic. On the reference
+examples, utterances without such a tie are bit-identical, and perceptual scores
+match (mean PESQ 1.283 vs 1.271, STOI 0.776 vs 0.776, ViSQOL 1.940 vs 1.946).
+
 ## Publish boundary
 
 Before publishing this directory, run:
@@ -157,7 +205,7 @@ python tools/audit_public_tree.py
 pytest
 ```
 
-The audit fails if a `.pt`, `.ptl`, `.ts`, `.pkl`, `.ckpt`, `.safetensors`, or `.npy`
-file; a training/data directory; or an import of the private `lscodec` package
+The audit fails if a `.pt`, `.ptl`, `.ts`, `.pkl`, `.ckpt`, `.safetensors`, `.npy`,
+or `.onnx` file; a training/data directory; or an import of the private `lscodec` package
 appears in the public tree. Weights remain versioned in the Hugging Face model
 repository instead of this code repository.

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Sequence
 
 import numpy as np
 import resampy
@@ -12,6 +12,13 @@ import soundfile as sf
 import torch
 from torch.jit.mobile import _load_for_lite_interpreter
 
+from .onnx_backend import (
+    CUDA_PROVIDER,
+    OnnxModule,
+    available_onnx_providers,
+    onnxruntime_installed,
+    select_onnx_providers,
+)
 from .streaming import (
     ENCODER_CONVOLUTIONS,
     FixedWindowEncoder,
@@ -29,10 +36,22 @@ TORCHSCRIPT_FILES = (
     "torchscript/lscodec_prompt.ts",
     "torchscript/lscodec_vocoder.ts",
 )
+ONNX_FILES = (
+    "onnx/lscodec_encoder.onnx",
+    "onnx/lscodec_prompt.onnx",
+    "onnx/lscodec_vocoder.onnx",
+)
 LITE_FILES = (
     "ptl/lscodec_encoder.ptl",
     "ptl/lscodec_vocoder.ptl",
 )
+# Artifact sets in ``backend="auto"`` preference order.
+ARTIFACT_SETS = {
+    "torchscript": TORCHSCRIPT_FILES,
+    "onnx": ONNX_FILES,
+    "lite": LITE_FILES,
+}
+BACKENDS = ("auto",) + tuple(ARTIFACT_SETS)
 DOWNLOAD_FILES = ("codebook.npy",) + TORCHSCRIPT_FILES + LITE_FILES
 INPUT_SAMPLE_RATE = 16_000
 OUTPUT_SAMPLE_RATE = 24_000
@@ -44,14 +63,64 @@ def _looks_like_local_path(value: str) -> bool:
     return value.startswith((".", "/", "~")) or os.path.sep * 2 in value
 
 
+def _check_backend(backend: str) -> str:
+    if backend not in BACKENDS:
+        raise ValueError(
+            f"unknown backend {backend!r}; expected one of {', '.join(BACKENDS)}"
+        )
+    return backend
+
+
+def download_patterns(backend: str = "auto") -> list[str]:
+    """Files to fetch from Hugging Face for ``backend``.
+
+    ``auto`` keeps the historical TorchScript + legacy ``.ptl`` download; the
+    ONNX set is fetched only when requested explicitly.
+    """
+    _check_backend(backend)
+    if backend == "auto":
+        return list(DOWNLOAD_FILES)
+    return ["codebook.npy", *ARTIFACT_SETS[backend]]
+
+
+def available_backends(model_dir: str | os.PathLike[str]) -> list[str]:
+    """Backends whose complete artifact set exists in ``model_dir``."""
+    root = Path(model_dir)
+    return [
+        name
+        for name, files in ARTIFACT_SETS.items()
+        if all((root / relative).is_file() for relative in files)
+    ]
+
+
+def choose_backend(requested: str, available: Sequence[str]) -> str:
+    """Pick the backend to load, preferring TorchScript, then ONNX, then Lite."""
+    _check_backend(requested)
+    if requested == "auto":
+        for name in ARTIFACT_SETS:
+            if name in available:
+                return name
+        raise FileNotFoundError(
+            "no complete artifact set found; expected one of: "
+            + "; ".join(", ".join(files) for files in ARTIFACT_SETS.values())
+        )
+    if requested not in available:
+        raise FileNotFoundError(
+            f"backend {requested!r} needs {', '.join(ARTIFACT_SETS[requested])}"
+        )
+    return requested
+
+
 def resolve_model_directory(
     model_name_or_path: str | os.PathLike[str],
     *,
     cache_dir: Optional[str | os.PathLike[str]] = None,
     revision: Optional[str] = None,
     local_files_only: bool = False,
+    backend: str = "auto",
 ) -> Path:
     """Resolve a local release directory or a Hugging Face model ID."""
+    _check_backend(backend)
     value = os.fspath(model_name_or_path)
     candidate = Path(value).expanduser()
     if candidate.is_dir():
@@ -74,7 +143,7 @@ def resolve_model_directory(
         model_dir = Path(
             snapshot_download(
                 repo_id=value,
-                allow_patterns=list(DOWNLOAD_FILES),
+                allow_patterns=download_patterns(backend),
                 cache_dir=(
                     os.fspath(cache_dir)
                     if cache_dir is not None
@@ -89,17 +158,12 @@ def resolve_model_directory(
         raise FileNotFoundError(
             f"incomplete LSCodec release at {model_dir}; missing: codebook.npy"
         )
-    has_torchscript = all(
-        (model_dir / relative).is_file() for relative in TORCHSCRIPT_FILES
-    )
-    has_lite = all(
-        (model_dir / relative).is_file() for relative in LITE_FILES
-    )
-    if not has_torchscript and not has_lite:
+    try:
+        choose_backend(backend, available_backends(model_dir))
+    except FileNotFoundError as error:
         raise FileNotFoundError(
-            f"incomplete LSCodec release at {model_dir}; expected either "
-            f"{', '.join(TORCHSCRIPT_FILES)} or {', '.join(LITE_FILES)}"
-        )
+            f"incomplete LSCodec release at {model_dir}: {error}"
+        ) from None
     return model_dir
 
 
@@ -205,28 +269,57 @@ class LSCodecStreaming:
         *,
         wavlm_path: str | os.PathLike[str],
         device: str | torch.device = "auto",
+        backend: str = "auto",
+        onnx_providers: Optional[Sequence[str]] = None,
+        onnx_threads: Optional[int] = None,
     ):
         self.model_dir = Path(model_dir).expanduser().resolve()
-        has_torchscript = all(
-            (self.model_dir / relative).is_file()
-            for relative in TORCHSCRIPT_FILES
-        )
+        available = available_backends(self.model_dir)
+        if backend == "auto" and not onnxruntime_installed():
+            available = [name for name in available if name != "onnx"]
+        self.artifact_format = choose_backend(backend, available)
         if str(device) == "auto":
-            device = (
-                "cuda"
-                if has_torchscript and torch.cuda.is_available()
-                else "cpu"
-            )
-        if not has_torchscript and torch.device(device).type != "cpu":
+            if self.artifact_format == "torchscript":
+                use_cuda = torch.cuda.is_available()
+            elif self.artifact_format == "onnx":
+                use_cuda = (
+                    torch.cuda.is_available()
+                    and CUDA_PROVIDER in available_onnx_providers()
+                )
+            else:
+                use_cuda = False
+            device = "cuda" if use_cuda else "cpu"
+        if (
+            self.artifact_format == "lite"
+            and torch.device(device).type != "cpu"
+        ):
             raise ValueError(
-                "the legacy .ptl artifacts are CPU/mobile-only; upload the "
-                "torchscript/*.ts release set for CUDA inference or pass "
-                "device='cpu'"
+                "the legacy .ptl artifacts are CPU/mobile-only; use the "
+                "torchscript/ or onnx/ release set for CUDA inference or "
+                "pass device='cpu'"
             )
         self.device = torch.device(device)
+        self.onnx_providers: Optional[list[str]] = None
 
-        if has_torchscript:
-            self.artifact_format = "torchscript"
+        if self.artifact_format == "onnx":
+            providers = (
+                list(onnx_providers)
+                if onnx_providers is not None
+                else select_onnx_providers(
+                    self.device, available_onnx_providers()
+                )
+            )
+            self.onnx_providers = providers
+            self.encoder, self.prompt_encoder, self.vocoder = (
+                OnnxModule.from_path(
+                    self.model_dir / relative,
+                    providers=providers,
+                    device=self.device,
+                    threads=onnx_threads,
+                )
+                for relative in ONNX_FILES
+            )
+        elif self.artifact_format == "torchscript":
             self.encoder = torch.jit.load(
                 str(self.model_dir / "torchscript/lscodec_encoder.ts"),
                 map_location=self.device,
@@ -240,7 +333,6 @@ class LSCodecStreaming:
                 map_location=self.device,
             ).eval()
         else:
-            self.artifact_format = "lite"
             self.prompt_encoder = None
             self.encoder = _load_for_lite_interpreter(
                 str(self.model_dir / "ptl/lscodec_encoder.ptl"),
@@ -285,6 +377,9 @@ class LSCodecStreaming:
         cache_dir: Optional[str | os.PathLike[str]] = None,
         revision: Optional[str] = None,
         local_files_only: bool = False,
+        backend: str = "auto",
+        onnx_providers: Optional[Sequence[str]] = None,
+        onnx_threads: Optional[int] = None,
     ) -> "LSCodecStreaming":
         """Load the release artifacts and the official WavLM checkpoint."""
         model_dir = resolve_model_directory(
@@ -292,6 +387,7 @@ class LSCodecStreaming:
             cache_dir=cache_dir,
             revision=revision,
             local_files_only=local_files_only,
+            backend=backend,
         )
         resolved_wavlm = (
             Path(wavlm_path).expanduser()
@@ -304,7 +400,12 @@ class LSCodecStreaming:
             ).expanduser()
         )
         return cls(
-            model_dir, wavlm_path=resolved_wavlm, device=device
+            model_dir,
+            wavlm_path=resolved_wavlm,
+            device=device,
+            backend=backend,
+            onnx_providers=onnx_providers,
+            onnx_threads=onnx_threads,
         )
 
     def prepare_audio(
